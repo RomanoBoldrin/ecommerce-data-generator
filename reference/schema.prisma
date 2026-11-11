@@ -1,0 +1,468 @@
+// Merchant Pulse — Prisma schema (Prisma ORM 7, PostgreSQL).
+// Source of truth: docs/DATA_MODEL.md, with the naming decisions recorded in its section 15.
+// Merchant Pulse is a SINGLE-STORE application: there is no Store/tenant model.
+//
+// Conventions
+// - Primary keys: UUID v7 (time-ordered, friendlier to B-tree indexes on large tables).
+// - Instants are stored as timestamptz (UTC). Business "days" (revenue, funnel cohort)
+//   are derived in the application timezone (America/Sao_Paulo) at query time, never stored as local time.
+// - Money: Decimal(12,2). Natural keys (SKU, external IDs, device code) are globally unique.
+// - This schema contains synthetic (DataSourceType.SYNTHETIC) and simulated (IoT) data
+//   in the demonstration environment; it never models real consumers.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// 1. Enums
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  ADMIN
+  MANAGER
+  ANALYST
+}
+
+// Purchase-journey stages. The funnel is computed per distinct VisitorSession,
+// never as a count of NavigationEvent rows.
+enum NavigationEventType {
+  SESSION_START
+  PRODUCT_VIEW
+  ADD_TO_CART
+  CHECKOUT_START
+  ORDER_COMPLETED
+}
+
+// Recognized revenue = PAID, SHIPPED, DELIVERED.
+// Excluded from revenue = PENDING, CANCELLED, RETURNED.
+enum OrderStatus {
+  PENDING
+  PAID
+  SHIPPED
+  DELIVERED
+  CANCELLED
+  RETURNED
+}
+
+// Logical ORIGIN of data (who produced it), not its file format.
+// Initial implementation: a single SYNTHETIC source (the Python generator).
+// EXTERNAL_EXPORT and API are reserved for future independent sources; using them
+// requires source-scoped identity/deduplication first (see docs/DATA_MODEL.md §4.11).
+enum DataSourceType {
+  SYNTHETIC
+  EXTERNAL_EXPORT
+  API
+}
+
+// Serialization format of an imported file. A property of one import run, not of a source.
+enum DataFileFormat {
+  CSV
+  PARQUET
+}
+
+enum DataImportStatus {
+  IN_PROGRESS
+  COMPLETED
+  ERROR
+}
+
+enum RecommendationPriority {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+// Defines how an IndicatorTarget is evaluated (a threshold needs a direction).
+enum TargetDirection {
+  HIGHER_IS_BETTER
+  LOWER_IS_BETTER
+}
+
+enum ForecastRunStatus {
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+// ---------------------------------------------------------------------------
+// 2. Authentication
+// ---------------------------------------------------------------------------
+
+// Dashboard user. Not a consumer: Merchant Pulse has no consumer accounts.
+model User {
+  id           String   @id @default(uuid(7)) @db.Uuid
+  name         String
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  role         UserRole
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  authSessions        AuthSession[]
+  passwordResetTokens PasswordResetToken[]
+
+  @@map("users")
+}
+
+// Authenticated DASHBOARD session. Unrelated to VisitorSession (shopper tracking).
+// Only a hash of the session token is stored; the raw token lives only in the cookie.
+model AuthSession {
+  sessionId String   @id @default(uuid(7)) @map("session_id") @db.Uuid
+  tokenHash String   @unique @map("token_hash")
+  userId    String   @map("user_id") @db.Uuid
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(3)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt]) // expired-session cleanup
+  @@index([userId, expiresAt]) // "active sessions of a user"
+  @@map("auth_sessions")
+}
+
+// Single-use, expiring. Only a hash of the token is stored. usedAt IS NULL = unused.
+model PasswordResetToken {
+  id        String    @id @default(uuid(7)) @db.Uuid
+  tokenHash String    @unique @map("token_hash")
+  userId    String    @map("user_id") @db.Uuid
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(3)
+  usedAt    DateTime? @map("used_at") @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// 3. E-commerce catalog
+// ---------------------------------------------------------------------------
+
+model Category {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  name        String   @unique
+  description String?
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  products        Product[]
+  demandForecasts DemandForecast[]
+
+  @@map("categories")
+}
+
+model Product {
+  id            String   @id @default(uuid(7)) @db.Uuid
+  categoryId    String   @map("category_id") @db.Uuid
+  name          String
+  sku           String   @unique
+  description   String?
+  price         Decimal  @db.Decimal(12, 2) // current catalog price; history lives in OrderItem.unitPrice
+  isActive      Boolean  @default(true) @map("is_active")
+  // Optional, read-only imported snapshot. Merchant Pulse does not manage inventory.
+  stockSnapshot Int?     @map("stock_snapshot")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  category         Category          @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  navigationEvents NavigationEvent[]
+  orderItems       OrderItem[]
+
+  @@index([categoryId])
+  @@map("products")
+}
+
+// ---------------------------------------------------------------------------
+// 4. Visitor behavior and navigation
+// ---------------------------------------------------------------------------
+
+// Pseudonymous shopper session (NOT a dashboard session). Hashes are pseudonymous,
+// not anonymous. No names, emails, phones or addresses are modeled.
+// Funnel cohort date = startedAt (in the application timezone).
+model VisitorSession {
+  id                String    @id @default(uuid(7)) @db.Uuid
+  dataImportId      String?   @map("data_import_id") @db.Uuid
+  externalSessionId String    @unique @map("external_session_id") // pseudonymous identifier from the source
+  visitorHash       String    @map("visitor_hash") // pseudonymous visitor identifier
+  startedAt         DateTime  @map("started_at") @db.Timestamptz(3)
+  endedAt           DateTime? @map("ended_at") @db.Timestamptz(3)
+  deviceType        String?   @map("device_type")
+  trafficSource     String?   @map("traffic_source")
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  dataImport       DataImport?       @relation(fields: [dataImportId], references: [id], onDelete: SetNull)
+  navigationEvents NavigationEvent[]
+  orders           Order[]
+
+  @@index([startedAt]) // funnel cohorts / date-range filters
+  @@index([visitorHash]) // new vs. returning pseudonymous visitors
+  @@index([dataImportId])
+  @@map("visitor_sessions")
+}
+
+// One row per recorded action. A session may have many events of the same type;
+// funnel queries must count DISTINCT visitorSessionId per stage and check
+// chronological order using occurredAt.
+model NavigationEvent {
+  id               String              @id @default(uuid(7)) @db.Uuid
+  visitorSessionId String              @map("visitor_session_id") @db.Uuid
+  productId        String?             @map("product_id") @db.Uuid
+  dataImportId     String?             @map("data_import_id") @db.Uuid
+  eventType        NavigationEventType @map("event_type")
+  occurredAt       DateTime            @map("occurred_at") @db.Timestamptz(3)
+  sourceEventId    String?             @map("source_event_id") // not every source provides one
+  // Deterministic key built by the ingestion pipeline (e.g. hash of session, type,
+  // timestamp, product), or derived from sourceEventId when present.
+  deduplicationKey String              @unique @map("deduplication_key")
+  createdAt        DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  visitorSession VisitorSession @relation(fields: [visitorSessionId], references: [id], onDelete: Cascade)
+  product        Product?       @relation(fields: [productId], references: [id], onDelete: SetNull)
+  dataImport     DataImport?    @relation(fields: [dataImportId], references: [id], onDelete: SetNull)
+
+  @@index([visitorSessionId, eventType, occurredAt]) // per-session stage lookup (funnel)
+  @@index([eventType, occurredAt]) // date-range aggregations by stage
+  @@index([productId, eventType]) // product views and cart additions
+  @@index([dataImportId])
+  @@map("navigation_events")
+}
+
+// ---------------------------------------------------------------------------
+// 5. Sales and orders
+// ---------------------------------------------------------------------------
+
+// Revenue is attributed to createdAt (application timezone), only for PAID/SHIPPED/DELIVERED.
+// One VisitorSession may produce several Orders, so order counts and converted-session
+// counts have different denominators.
+// Intended invariant: total = subtotal - discount + shippingAmount (see docs/DATA_MODEL.md §15).
+model Order {
+  id               String      @id @default(uuid(7)) @db.Uuid
+  visitorSessionId String?     @map("visitor_session_id") @db.Uuid
+  dataImportId     String?     @map("data_import_id") @db.Uuid
+  externalOrderId  String      @unique @map("external_order_id")
+  status           OrderStatus
+  subtotal         Decimal     @db.Decimal(12, 2)
+  discount         Decimal     @default(0) @db.Decimal(12, 2)
+  shippingAmount   Decimal     @default(0) @map("shipping_amount") @db.Decimal(12, 2)
+  total            Decimal     @db.Decimal(12, 2)
+  // Order creation instant in the source system; importers must set it explicitly.
+  createdAt        DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime    @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  visitorSession VisitorSession? @relation(fields: [visitorSessionId], references: [id], onDelete: SetNull)
+  dataImport     DataImport?     @relation(fields: [dataImportId], references: [id], onDelete: SetNull)
+  items          OrderItem[]
+
+  @@index([status, createdAt]) // revenue by eligible status and date
+  @@index([createdAt])
+  @@index([visitorSessionId])
+  @@index([dataImportId])
+  @@map("orders")
+}
+
+model OrderItem {
+  id        String   @id @default(uuid(7)) @db.Uuid
+  orderId   String   @map("order_id") @db.Uuid
+  productId String   @map("product_id") @db.Uuid
+  quantity  Int
+  // Price per unit at purchase time. Historical revenue must use this, not Product.price.
+  unitPrice Decimal  @map("unit_price") @db.Decimal(12, 2)
+  discount  Decimal  @default(0) @db.Decimal(12, 2) // line-level discount
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  order   Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([orderId])
+  @@index([productId]) // product sales ranking
+  @@map("order_items")
+}
+
+// ---------------------------------------------------------------------------
+// 6. Data ingestion
+// ---------------------------------------------------------------------------
+
+// Logical origin of imported data. The initial database holds ONE row: the Python
+// synthetic-data generator (type SYNTHETIC). CSV and Parquet are formats of its output,
+// not separate sources.
+model DataSource {
+  id          String         @id @default(uuid(7)) @db.Uuid
+  name        String         @unique
+  type        DataSourceType // SYNTHETIC marks generated demonstration data, never real transactions
+  description String?
+  isActive    Boolean        @default(true) @map("is_active")
+  createdAt   DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  dataImports DataImport[]
+
+  @@map("data_sources")
+}
+
+// One batch/execution of an import, used for provenance (dataImportId on sessions,
+// events and orders) and processing counts. Retries are safe because business records
+// are deduplicated by their own globally unique keys, not by the import run.
+// Global uniqueness is valid only while a single generator guarantees unique identifiers.
+model DataImport {
+  id               String           @id @default(uuid(7)) @db.Uuid
+  dataSourceId     String           @map("data_source_id") @db.Uuid
+  status           DataImportStatus @default(IN_PROGRESS)
+  fileName         String?          @map("file_name")
+  fileFormat       DataFileFormat?  @map("file_format")
+  recordsProcessed Int              @default(0) @map("records_processed")
+  recordsFailed    Int              @default(0) @map("records_failed")
+  errorMessage     String?          @map("error_message")
+  startedAt        DateTime         @default(now()) @map("started_at") @db.Timestamptz(3)
+  finishedAt       DateTime?        @map("finished_at") @db.Timestamptz(3)
+  createdAt        DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  dataSource       DataSource        @relation(fields: [dataSourceId], references: [id], onDelete: Restrict)
+  visitorSessions  VisitorSession[]
+  navigationEvents NavigationEvent[]
+  orders           Order[]
+
+  @@index([createdAt])
+  @@index([status])
+  @@index([dataSourceId, startedAt])
+  @@map("data_imports")
+}
+
+// ---------------------------------------------------------------------------
+// 7. IoT monitoring (SIMULATED telemetry; no physical sensors)
+// ---------------------------------------------------------------------------
+
+model IoTDevice {
+  id            String   @id @default(uuid(7)) @db.Uuid
+  deviceCode    String   @unique @map("device_code")
+  name          String
+  description   String?
+  locationLabel String?  @map("location_label")
+  isActive      Boolean  @default(true) @map("is_active")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  readings IoTReading[]
+
+  @@map("iot_devices")
+}
+
+// One row per device per interval holding all three measurements
+// (10 devices x 288 readings/day x 180 days = 518,400 rows).
+// Thresholds are NOT stored here; they are configurable demonstration parameters
+// held in IndicatorTarget and compared at query time.
+model IoTReading {
+  id                  String   @id @default(uuid(7)) @db.Uuid
+  deviceId            String   @map("device_id") @db.Uuid
+  recordedAt          DateTime @map("recorded_at") @db.Timestamptz(3)
+  temperatureCelsius  Decimal  @map("temperature_celsius") @db.Decimal(5, 2)
+  relativeHumidity    Decimal  @map("relative_humidity") @db.Decimal(5, 2) // percent, 0-100
+  energyConsumptionKw Decimal  @map("energy_consumption_kw") @db.Decimal(8, 3)
+  createdAt           DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  device IoTDevice @relation(fields: [deviceId], references: [id], onDelete: Restrict)
+
+  // Prevents duplicate readings and serves device/time-range queries (leading column deviceId).
+  @@unique([deviceId, recordedAt])
+  @@index([recordedAt]) // all-device time-range queries
+  @@map("iot_readings")
+}
+
+// ---------------------------------------------------------------------------
+// 8. Analytics and recommendations
+// ---------------------------------------------------------------------------
+
+// Configured goal/thresholds for a documented indicator (e.g. "conversion_rate",
+// "iot.temperature_celsius"). Actual values are computed from source tables, not stored here.
+model IndicatorTarget {
+  id                String          @id @default(uuid(7)) @db.Uuid
+  indicatorKey      String          @unique @map("indicator_key")
+  name              String
+  description       String?
+  direction         TargetDirection
+  unit              String?
+  targetValue       Decimal         @map("target_value") @db.Decimal(14, 4)
+  warningThreshold  Decimal?        @map("warning_threshold") @db.Decimal(14, 4)
+  criticalThreshold Decimal?        @map("critical_threshold") @db.Decimal(14, 4)
+  isActive          Boolean         @default(true) @map("is_active")
+  createdAt         DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("indicator_targets")
+}
+
+// Persistence only. Rule-based; not an ML prediction unless a model generated it.
+model Recommendation {
+  id            String                 @id @default(uuid(7)) @db.Uuid
+  indicatorKey  String?                @map("indicator_key")
+  title         String
+  description   String
+  priority      RecommendationPriority
+  observedValue Decimal?               @map("observed_value") @db.Decimal(14, 4)
+  targetValue   Decimal?               @map("target_value") @db.Decimal(14, 4)
+  isActive      Boolean                @default(true) @map("is_active")
+  createdAt     DateTime               @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime               @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@index([isActive, priority])
+  @@index([createdAt])
+  @@map("recommendations")
+}
+
+// ---------------------------------------------------------------------------
+// 9. Demand forecasting (precomputed by the Python workspace, not live inference)
+// ---------------------------------------------------------------------------
+
+// Date ranges are business dates (no time zone). Metrics are optional because a run
+// may be RUNNING/FAILED, and the baseline is seasonal-naive (same weekday, previous week).
+model ForecastRun {
+  id                  String            @id @default(uuid(7)) @db.Uuid
+  modelName           String            @map("model_name")
+  modelVersion        String            @map("model_version")
+  status              ForecastRunStatus @default(RUNNING)
+  trainedAt           DateTime?         @map("trained_at") @db.Timestamptz(3)
+  trainingStartDate   DateTime?         @map("training_start_date") @db.Date
+  trainingEndDate     DateTime?         @map("training_end_date") @db.Date
+  validationStartDate DateTime?         @map("validation_start_date") @db.Date
+  validationEndDate   DateTime?         @map("validation_end_date") @db.Date
+  testStartDate       DateTime?         @map("test_start_date") @db.Date
+  testEndDate         DateTime?         @map("test_end_date") @db.Date
+  // Held-out test-set metrics.
+  mae                 Float?
+  rmse                Float?
+  r2                  Float?
+  baselineMae         Float?            @map("baseline_mae")
+  baselineRmse        Float?            @map("baseline_rmse")
+  createdAt           DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  forecasts DemandForecast[]
+
+  @@index([createdAt])
+  @@map("forecast_runs")
+}
+
+model DemandForecast {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  forecastRunId  String   @map("forecast_run_id") @db.Uuid
+  categoryId     String   @map("category_id") @db.Uuid
+  targetDate     DateTime @map("target_date") @db.Date // business date in the application timezone
+  predictedUnits Float    @map("predicted_units")
+  actualUnits    Int?     @map("actual_units") // filled when the date has observed sales
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  forecastRun ForecastRun @relation(fields: [forecastRunId], references: [id], onDelete: Cascade)
+  category    Category    @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+
+  @@unique([forecastRunId, categoryId, targetDate])
+  @@index([categoryId, targetDate])
+  @@map("demand_forecasts")
+}
